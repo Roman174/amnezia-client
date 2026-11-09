@@ -1,0 +1,244 @@
+diff --git a/device/peer.go b/device/peer.go
+index 2bcb16c..54ab203 100644
+--- a/device/peer.go
++++ b/device/peer.go
+@@ -21,9 +21,11 @@ type Peer struct {
+ 	handshake         Handshake
+ 	device            *Device
+ 	stopping          sync.WaitGroup // routines pending stop
+-	txBytes           atomic.Uint64  // bytes send to peer (endpoint)
+-	rxBytes           atomic.Uint64  // bytes received from peer
+-	lastHandshakeNano atomic.Int64   // nano seconds since epoch
++	tunTxBytes        atomic.Uint64
++	txErrors          atomic.Uint64
++	txBytes           atomic.Uint64 // bytes send to peer (endpoint)
++	rxBytes           atomic.Uint64 // bytes received from peer
++	lastHandshakeNano atomic.Int64  // nano seconds since epoch
+ 
+ 	endpoint struct {
+ 		sync.Mutex
+@@ -144,6 +146,8 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
+ 			totalLen += uint64(len(b))
+ 		}
+ 		peer.txBytes.Add(totalLen)
++	} else {
++		peer.txErrors.Add(1)
+ 	}
+ 	return err
+ }
+diff --git a/device/send.go b/device/send.go
+index 4a303d2..d078e23 100644
+--- a/device/send.go
++++ b/device/send.go
+@@ -371,6 +371,7 @@ func (device *Device) RoutineReadFromTUN() {
+ 			if peer == nil {
+ 				continue
+ 			}
++			peer.tunTxBytes.Add(uint64(len(elem.packet)))
+ 			elemsForPeer, ok := elemsByPeer[peer]
+ 			if !ok {
+ 				elemsForPeer = device.GetOutboundElementsContainer()
+diff --git a/device/timers.go b/device/timers.go
+index 4a5499d..927b78b 100644
+--- a/device/timers.go
++++ b/device/timers.go
+@@ -23,6 +23,7 @@ type Timer struct {
+ 	modifyingLock sync.RWMutex
+ 	runningLock   sync.Mutex
+ 	duration      time.Duration
++	isPending     bool
+ }
+ 
+ func (peer *Peer) NewTimer(expirationFunction func(*Peer, time.Duration)) *Timer {
+@@ -32,13 +33,14 @@ func (peer *Peer) NewTimer(expirationFunction func(*Peer, time.Duration)) *Timer
+ 		defer timer.runningLock.Unlock()
+ 
+ 		timer.modifyingLock.Lock()
+-		if timer.duration == 0 {
++		if !timer.isPending {
+ 			timer.modifyingLock.Unlock()
+ 			return
+ 		}
+ 		duration := timer.duration
+-		timer.modifyingLock.Unlock()
++		timer.isPending = false
+ 		timer.duration = 0
++		timer.modifyingLock.Unlock()
+ 
+ 		expirationFunction(peer, duration)
+ 	})
+@@ -49,6 +51,7 @@ func (peer *Peer) NewTimer(expirationFunction func(*Peer, time.Duration)) *Timer
+ func (timer *Timer) Mod(d time.Duration) {
+ 	timer.modifyingLock.Lock()
+ 	timer.duration = d
++	timer.isPending = true
+ 	timer.Reset(d)
+ 	timer.modifyingLock.Unlock()
+ }
+@@ -56,6 +59,7 @@ func (timer *Timer) Mod(d time.Duration) {
+ func (timer *Timer) Del() {
+ 	timer.modifyingLock.Lock()
+ 	timer.duration = 0
++	timer.isPending = false
+ 	timer.Stop()
+ 	timer.modifyingLock.Unlock()
+ }
+@@ -70,7 +74,7 @@ func (timer *Timer) DelSync() {
+ func (timer *Timer) IsPending() bool {
+ 	timer.modifyingLock.RLock()
+ 	defer timer.modifyingLock.RUnlock()
+-	return timer.duration > 0
++	return timer.isPending
+ }
+ 
+ func (peer *Peer) timersActive() bool {
+diff --git a/device/uapi.go b/device/uapi.go
+index 4fc162e..55de07f 100644
+--- a/device/uapi.go
++++ b/device/uapi.go
+@@ -207,6 +207,8 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
+ 
+ 			sendf("last_handshake_time_sec=%d", secs)
+ 			sendf("last_handshake_time_nsec=%d", nano)
++			sendf("tun_tx_bytes=%d", peer.tunTxBytes.Load())
++			sendf("tx_errors=%d", peer.txErrors.Load())
+ 			sendf("tx_bytes=%d", peer.txBytes.Load())
+ 			sendf("rx_bytes=%d", peer.rxBytes.Load())
+ 
+diff --git a/device/probe.go b/device/probe.go
+new file mode 100644
+index 0000000..6b8b954
+--- /dev/null
++++ b/device/probe.go
+@@ -0,0 +1,35 @@
++package device
++
++import (
++	"errors"
++	"time"
++)
++
++func (device *Device) Probe() (time.Duration, error) {
++	if !device.isUp() {
++		return 0, errors.New("device is down")
++	}
++	device.peers.RLock()
++	peers := make([]*Peer, 0, len(device.peers.keyMap))
++	for _, peer := range device.peers.keyMap {
++		peers = append(peers, peer)
++	}
++	device.peers.RUnlock()
++	if len(peers) == 0 {
++		return 0, errors.New("device has no peers")
++	}
++	var wait time.Duration
++	for _, peer := range peers {
++		peer.handshake.mutex.RLock()
++		remaining := device.rekeyMinTimeout() - time.Since(peer.handshake.lastSentHandshake)
++		peer.handshake.mutex.RUnlock()
++		if remaining > 0 {
++			wait = max(wait, remaining)
++			continue
++		}
++		if err := peer.SendHandshakeInitiation(false); err != nil {
++			return 0, err
++		}
++	}
++	return wait, nil
++}
+diff --git a/device/timers_recovery_test.go b/device/timers_recovery_test.go
+new file mode 100644
+index 0000000..ea5f3db
+--- /dev/null
++++ b/device/timers_recovery_test.go
+@@ -0,0 +1,90 @@
++package device
++
++import (
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestTimerExpiryRace(t *testing.T) {
++	var peer Peer
++	timer := peer.NewTimer(func(*Peer, time.Duration) {})
++	defer timer.DelSync()
++	deadline := time.Now().Add(5 * time.Second)
++	for i := 0; i < 100; i++ {
++		timer.Mod(time.Microsecond)
++		for timer.IsPending() {
++			if time.Now().After(deadline) {
++				t.Fatal("timer did not expire")
++			}
++		}
++	}
++}
++
++func TestTimerZeroDurationAndRearm(t *testing.T) {
++	var peer Peer
++	expired := make(chan time.Duration, 2)
++	timer := peer.NewTimer(func(_ *Peer, d time.Duration) { expired <- d })
++	defer timer.DelSync()
++	for _, duration := range []time.Duration{0, time.Millisecond} {
++		timer.Mod(duration)
++		select {
++		case got := <-expired:
++			if got != duration {
++				t.Fatalf("duration = %v, want %v", got, duration)
++			}
++		case <-time.After(time.Second):
++			t.Fatal("timer did not expire")
++		}
++	}
++	timer.Mod(time.Hour)
++	timer.DelSync()
++	if timer.IsPending() {
++		t.Fatal("deleted timer is pending")
++	}
++}
++
++func TestRecoveryProbeAndTelemetry(t *testing.T) {
++	pair := genTestPair(t, false)
++	device := pair[0].dev
++	device.peers.RLock()
++	var remote *Peer
++	for _, peer := range device.peers.keyMap {
++		remote = peer
++		break
++	}
++	device.peers.RUnlock()
++	if remote == nil {
++		t.Fatal("missing peer")
++	}
++	if wait, err := device.Probe(); err != nil || wait != 0 {
++		t.Fatalf("probe failed: %v, wait %v", err, wait)
++	}
++	deadline := time.Now().Add(5 * time.Second)
++	for remote.lastHandshakeNano.Load() == 0 {
++		if time.Now().After(deadline) {
++			t.Fatal("probe handshake did not complete")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	if remote.tunTxBytes.Load() != 0 {
++		t.Fatal("handshake counted as application traffic")
++	}
++	if wait, err := device.Probe(); err != nil || wait <= 0 {
++		t.Fatal("probe did not report its cooldown")
++	}
++	pair.Send(t, Pong, nil)
++	if remote.tunTxBytes.Load() == 0 {
++		t.Fatal("application demand not counted")
++	}
++	config, err := device.IpcGet()
++	if err != nil || !strings.Contains(config, "tun_tx_bytes=") || !strings.Contains(config, "tx_errors=") {
++		t.Fatal("missing recovery telemetry")
++	}
++	if err := device.Down(); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := device.Probe(); err == nil {
++		t.Fatal("down device accepted probe")
++	}
++}

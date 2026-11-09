@@ -1,0 +1,7 @@
+go_toolchain:
+  x86_64:
+    url: "https://go.dev/dl/go1.25.0.windows-amd64.zip"
+    sha256: "89efb4f9b30812eee083cc1770fdd2913c14d301064f6454851428f9707d190b"
+  armv8:
+    url: "https://go.dev/dl/go1.25.0.windows-arm64.zip"
+    sha256: "27bab004c72b3d7bd05a69b6ec0fc54a309b4b78cc569dd963d8b3ec28bfdb8c"
