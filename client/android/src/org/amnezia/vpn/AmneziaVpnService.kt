@@ -18,6 +18,7 @@ import android.os.Message
 import android.os.Messenger
 import android.os.PowerManager
 import android.os.Process
+import android.os.SystemClock
 import androidx.annotation.MainThread
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -25,6 +26,7 @@ import androidx.core.content.getSystemService
 import java.net.UnknownHostException
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.LazyThreadSafetyMode.NONE
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -50,6 +52,8 @@ import org.amnezia.vpn.protocol.ProtocolState.UNKNOWN
 import org.amnezia.vpn.protocol.VpnException
 import org.amnezia.vpn.protocol.VpnStartException
 import org.amnezia.vpn.protocol.putStatus
+import org.amnezia.vpn.protocol.wireguard.Wireguard
+import org.amnezia.vpn.protocol.wireguard.recovery.TunnelRecovery
 import org.amnezia.vpn.util.LoadLibraryException
 import org.amnezia.vpn.util.Log
 import org.amnezia.vpn.util.Prefs
@@ -97,6 +101,9 @@ open class AmneziaVpnService : VpnService() {
     private val isUnknown
         get() = protocolState.value == UNKNOWN
 
+    private var networkBindingJob: Job? = null
+    private var recovery: TunnelRecovery? = null
+    private var idleReceiver: BroadcastReceiver? = null
     private var connectionJob: Job? = null
     private var disconnectionJob: Job? = null
     private var trafficStatsUpdateJob: Job? = null
@@ -211,7 +218,7 @@ open class AmneziaVpnService : VpnService() {
         connectionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + connectionExceptionHandler)
         loadServerData()
         launchProtocolStateHandler()
-        networkState = NetworkState(this, ::reconnect)
+        networkState = NetworkState(context = this, onNetworkChange = ::onNetworkChanged)
         trafficStats = TrafficStats()
         registerBroadcastReceivers()
     }
@@ -274,6 +281,7 @@ open class AmneziaVpnService : VpnService() {
     override fun onDestroy() {
         Log.d(TAG, "Destroy service")
         unregisterBroadcastReceivers()
+        networkState.unbindNetworkListener()
         runBlocking {
             disconnect()
             disconnectionJob?.join()
@@ -330,15 +338,43 @@ open class AmneziaVpnService : VpnService() {
     }
 
     private fun registerScreenStateBroadcastReceivers() {
-        if (serviceNotification.isNotificationEnabled()) {
-            Log.d(TAG, "Register screen state broadcast receivers")
-            screenOnReceiver = registerBroadcastReceiver(Intent.ACTION_SCREEN_ON) {
-                if (isConnected && serviceNotification.isNotificationEnabled()) startTrafficStatsUpdateJob()
+        if (screenOnReceiver != null) {
+            return
+        }
+        screenOnReceiver = registerBroadcastReceiver(Intent.ACTION_SCREEN_ON) {
+            updateRecoveryPower()
+            if (isConnected && serviceNotification.isNotificationEnabled()) {
+                startTrafficStatsUpdateJob()
             }
+        }
+        screenOffReceiver = registerBroadcastReceiver(Intent.ACTION_SCREEN_OFF) {
+            updateRecoveryPower()
+            stopTrafficStatsUpdateJob()
+        }
+        idleReceiver = registerBroadcastReceiver(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED) {
+            updateRecoveryPower()
+        }
+    }
 
-            screenOffReceiver = registerBroadcastReceiver(Intent.ACTION_SCREEN_OFF) {
-                stopTrafficStatsUpdateJob()
-            }
+    private fun updateRecoveryPower() {
+        val power = getSystemService<PowerManager>()
+        recovery?.updatePower(
+            interactive = power?.isInteractive != false,
+            idle = power?.isDeviceIdleMode == true,
+        )
+    }
+
+    private fun onNetworkChanged() {
+        val controller = recovery
+        if (controller != null) {
+            updateRecoveryPower()
+            controller.updateNetwork(
+                online = networkState.isOnline,
+                epoch = networkState.epoch,
+                networkId = networkState.networkId,
+            )
+        } else if (networkState.isOnline && networkState.epoch > 1) {
+            reconnect()
         }
     }
 
@@ -346,6 +382,8 @@ open class AmneziaVpnService : VpnService() {
         Log.d(TAG, "Unregister screen state broadcast receivers")
         unregisterBroadcastReceiver(screenOnReceiver)
         unregisterBroadcastReceiver(screenOffReceiver)
+        unregisterBroadcastReceiver(idleReceiver)
+        idleReceiver = null
         screenOnReceiver = null
         screenOffReceiver = null
     }
@@ -439,7 +477,6 @@ open class AmneziaVpnService : VpnService() {
 
     @MainThread
     private fun disableNotification() {
-        unregisterScreenStateBroadcastReceivers()
         stopTrafficStatsUpdateJob()
     }
 
@@ -492,7 +529,12 @@ open class AmneziaVpnService : VpnService() {
 
     @MainThread
     private fun connectToVpn(vpnConfig: String) {
-        if (isConnected || protocolState.value == CONNECTING) return
+        if (connectionJob?.isActive == true || disconnectionJob?.isActive == true ||
+            protocolState.value == CONNECTING || protocolState.value == RECONNECTING ||
+            protocolState.value == DISCONNECTING || isConnected
+        ) {
+            return
+        }
 
         Log.d(TAG, "Start VPN connection")
 
@@ -519,30 +561,93 @@ open class AmneziaVpnService : VpnService() {
             return
         }
 
+        val protocol = requireNotNull(vpnProto).protocol
+        val controller = if (protocol is Wireguard) createRecovery(protocol = protocol, config = config) else null
+        recovery = controller
+        updateRecoveryPower()
+        controller?.updateNetwork(
+            online = networkState.isOnline,
+            epoch = networkState.epoch,
+            networkId = networkState.networkId,
+        )
         connectionJob = connectionScope.launch {
-            disconnectionJob?.join()
-            disconnectionJob = null
-
-            vpnProto?.protocol?.let { protocol ->
-                protocol.initialize(applicationContext, protocolState, ::onError)
+            protocol.initialize(
+                context = applicationContext,
+                state = protocolState,
+                onError = ::onError,
+            )
+            if (controller != null) {
+                try {
+                    controller.run()
+                } finally {
+                    protocol.stopVpn()
+                }
+            } else {
                 protocol.startVpn(config, Builder(), ::protect)
+            }
+        }
+        if (controller != null) {
+            networkBindingJob = mainScope.launch {
+                try {
+                    networkState.bindNetworkListener()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    onError("Unable to monitor the physical network")
+                    disconnect()
+                }
             }
         }
     }
 
+    private fun createRecovery(
+        protocol: Wireguard,
+        config: JSONObject,
+    ): TunnelRecovery {
+        return TunnelRecovery(
+            state = protocolState,
+            start = {
+                protocol.startVpn(config = config, vpnBuilder = Builder(), protect = ::protect)
+            },
+            restart = {
+                protocol.reconnectVpn(vpnBuilder = Builder(), protect = ::protect)
+            },
+            stop = protocol::stopVpn,
+            snapshot = {
+                protocol.readSnapshot().also { snapshot ->
+                    Log.d(TAG, "Tunnel health: $snapshot")
+                }
+            },
+            probe = protocol::probe,
+            elapsedMillis = SystemClock::elapsedRealtime,
+            onFailure = {
+                onError("WireGuard connection recovery failed")
+            },
+        )
+    }
+
     @MainThread
     private fun disconnect() {
-        if (isUnknown || isDisconnected || protocolState.value == DISCONNECTING) return
+        recovery = null
+        networkBindingJob?.cancel()
+        networkBindingJob = null
+        if (protocolState.value == DISCONNECTING ||
+            ((isUnknown || isDisconnected) && connectionJob?.isActive != true)
+        ) {
+            return
+        }
 
         Log.d(TAG, "Stop VPN connection")
 
         protocolState.value = DISCONNECTING
 
+        val session = connectionJob
+        val protocol = vpnProto?.protocol
         disconnectionJob = connectionScope.launch {
-            connectionJob?.cancelAndJoin()
+            session?.cancelAndJoin()
             connectionJob = null
 
-            vpnProto?.protocol?.stopVpn()
+            protocol?.stopVpn()
 
             try {
                 withTimeout(DISCONNECT_TIMEOUT) {

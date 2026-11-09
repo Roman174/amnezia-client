@@ -1,19 +1,14 @@
 package org.amnezia.vpn.protocol.wireguard
 
 import android.net.VpnService.Builder
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import android.os.ParcelFileDescriptor
 import org.amnezia.awg.GoBackend
 import org.amnezia.vpn.protocol.Protocol
-import org.amnezia.vpn.protocol.ProtocolState.CONNECTED
 import org.amnezia.vpn.protocol.ProtocolState.DISCONNECTED
 import org.amnezia.vpn.protocol.Statistics
 import org.amnezia.vpn.protocol.VpnException
 import org.amnezia.vpn.protocol.VpnStartException
+import org.amnezia.vpn.protocol.wireguard.recovery.TunnelSnapshot
 import org.amnezia.vpn.util.LibraryLoader.loadSharedLibrary
 import org.amnezia.vpn.util.Log
 import org.amnezia.vpn.util.asSequence
@@ -27,43 +22,36 @@ private const val TAG = "Wireguard"
 
 open class Wireguard : Protocol() {
 
+    private val backendLock = Any()
+    private var tunnelDescriptor: ParcelFileDescriptor? = null
     private var tunnelHandle: Int = -1
     private var config: WireguardConfig? = null // save config for reconnect
     protected open val ifName: String = "amn0"
-    private lateinit var scope: CoroutineScope
-    private var statusJob: Job? = null
 
     override val statistics: Statistics
-        get() {
-            if (tunnelHandle == -1) return Statistics.EMPTY_STATISTICS
-            val config = GoBackend.awgGetConfig(tunnelHandle) ?: return Statistics.EMPTY_STATISTICS
-            return Statistics.build {
-                var optsCount = 0
-                config.splitToSequence("\n").forEach { line ->
-                    with(line) {
-                        when {
-                            startsWith("rx_bytes=") -> setRxBytes(substring(9).toLong()).also { ++optsCount }
-                            startsWith("tx_bytes=") -> setTxBytes(substring(9).toLong()).also { ++optsCount }
-                            else -> {}
-                        }
-                    }
-                    if (optsCount == 2) return@forEach
+        get() = synchronized(backendLock) {
+            val telemetry = readSnapshot()
+            if (telemetry == null) {
+                Statistics.EMPTY_STATISTICS
+            } else {
+                Statistics.build {
+                    setRxBytes(telemetry.receivedBytes)
+                    setTxBytes(telemetry.sentBytes)
                 }
             }
         }
 
     override fun internalInit() {
         if (!isInitialized) loadSharedLibrary(context, "wg-go")
-        if (this::scope.isInitialized) {
-            scope.cancel()
-        }
-        scope = CoroutineScope(Dispatchers.IO)
+
     }
 
     override suspend fun startVpn(config: JSONObject, vpnBuilder: Builder, protect: (Int) -> Boolean) {
         val wireguardConfig = parseConfig(config)
-        start(wireguardConfig, vpnBuilder, protect)
-        this.config = wireguardConfig
+        synchronized(backendLock) {
+            this.config = wireguardConfig
+            start(config = wireguardConfig, vpnBuilder = vpnBuilder, protect = protect)
+        }
     }
 
     protected open fun parseConfig(config: JSONObject): WireguardConfig {
@@ -154,98 +142,78 @@ open class Wireguard : Protocol() {
             ?.let { setDisableCookies(it) }
     }
 
+    fun readSnapshot(): TunnelSnapshot? = synchronized(backendLock) {
+        if (tunnelHandle < 0) {
+            null
+        } else {
+            TunnelSnapshot.parse(GoBackend.awgGetConfig(tunnelHandle))
+        }
+    }
+
+    fun probe(): Long = synchronized(backendLock) {
+        try {
+            if (tunnelHandle < 0) -1L else GoBackend.awgProbe(tunnelHandle).toLong()
+        } catch (_: LinkageError) {
+            throw VpnException("Incompatible WireGuard recovery backend")
+        }
+    }
+
+    override fun stopVpn() {
+        synchronized(backendLock) {
+            turnOffVpn()
+            tunnelDescriptor?.close()
+            tunnelDescriptor = null
+            config = null
+            state.value = DISCONNECTED
+        }
+    }
+
+    override fun reconnectVpn(
+        vpnBuilder: Builder,
+        protect: (Int) -> Boolean,
+    ) {
+        synchronized(backendLock) {
+            val config = this.config ?: throw VpnException("Reconnect config is empty")
+            turnOffVpn()
+            start(config = config, vpnBuilder = vpnBuilder, protect = protect)
+        }
+    }
+
     private fun start(
         config: WireguardConfig,
         vpnBuilder: Builder,
         protect: (Int) -> Boolean,
-        stopExistingVpn: Boolean = false
     ) {
-        if (!stopExistingVpn && tunnelHandle != -1) {
-            Log.w(TAG, "Tunnel already up")
+        if (tunnelHandle >= 0) {
             return
         }
-
-        buildVpnInterface(config, vpnBuilder)
-
-        vpnBuilder.establish().use { tunFd ->
-            if (stopExistingVpn && tunnelHandle != -1) {
-                turnOffVpn()
-            }
-            if (tunFd == null) {
-                throw VpnStartException("Create VPN interface: permission not granted or revoked")
-            }
-            Log.i(TAG, "awg-go backend ${GoBackend.awgVersion()}")
-            tunnelHandle = GoBackend.awgTurnOn(ifName, tunFd.detachFd(), config.toWgUserspaceString())
+        if (tunnelDescriptor == null) {
+            buildVpnInterface(config, vpnBuilder)
+            tunnelDescriptor = vpnBuilder.establish()
+                ?: throw VpnStartException("Create VPN interface: permission not granted or revoked")
         }
-
+        val descriptor = requireNotNull(tunnelDescriptor)
+        Log.i(TAG, "awg-go backend ${GoBackend.awgVersion()}")
+        tunnelHandle = GoBackend.awgTurnOn(
+            ifName = ifName,
+            tunFd = ParcelFileDescriptor.dup(descriptor.fileDescriptor).detachFd(),
+            settings = config.toWgUserspaceString(),
+        )
         if (tunnelHandle < 0) {
             tunnelHandle = -1
             throw VpnStartException("Wireguard tunnel creation error")
         }
-
         if (!protect(GoBackend.awgGetSocketV4(tunnelHandle)) || !protect(GoBackend.awgGetSocketV6(tunnelHandle))) {
-            GoBackend.awgTurnOff(tunnelHandle)
-            tunnelHandle = -1
+            turnOffVpn()
             throw VpnStartException("Protect VPN interface: permission not granted or revoked")
         }
-        launchStatusJob()
-    }
-
-    private fun launchStatusJob() {
-        Log.d(TAG, "Launch status job")
-        statusJob = scope.launch {
-            while (true) {
-                val lastHandshake = getLastHandshake()
-                Log.v(TAG, "lastHandshake=$lastHandshake")
-                if (lastHandshake == 0L) {
-                    delay(1000)
-                    continue
-                }
-                if (lastHandshake == -2L || lastHandshake > 0L) state.value = CONNECTED
-                else if (lastHandshake == -1L) state.value = DISCONNECTED
-                statusJob = null
-                break
-            }
-        }
-    }
-
-    private fun getLastHandshake(): Long {
-        if (tunnelHandle == -1) {
-            Log.e(TAG, "Trying to get config of a non-existent tunnel")
-            return -1
-        }
-        val config = GoBackend.awgGetConfig(tunnelHandle)
-        if (config == null) {
-            Log.e(TAG, "Failed to get tunnel config")
-            return -2
-        }
-        val lastHandshake = config.lines().find { it.startsWith("last_handshake_time_sec=") }?.substring(24)?.toLong()
-        if (lastHandshake == null) {
-            Log.e(TAG, "Failed to get last_handshake_time_sec")
-            return -2
-        }
-        return lastHandshake
     }
 
     private fun turnOffVpn() {
-        statusJob?.cancel()
-        statusJob = null
         val handleToClose = tunnelHandle
         tunnelHandle = -1
-        GoBackend.awgTurnOff(handleToClose)
-    }
-
-    override fun stopVpn() {
-        if (tunnelHandle == -1) {
-            Log.w(TAG, "Tunnel already down")
-            return
+        if (handleToClose >= 0) {
+            GoBackend.awgTurnOff(handleToClose)
         }
-        turnOffVpn()
-        state.value = DISCONNECTED
-    }
-
-    override fun reconnectVpn(vpnBuilder: Builder, protect: (Int) -> Boolean) {
-        val config = this.config ?: throw VpnException("Reconnect config is empty")
-        start(config, vpnBuilder, protect, true)
     }
 }

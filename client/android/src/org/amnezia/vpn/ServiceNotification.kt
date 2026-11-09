@@ -15,6 +15,8 @@ import androidx.core.app.NotificationCompat.Action
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import org.amnezia.vpn.protocol.ProtocolState
+import org.amnezia.vpn.protocol.ProtocolState.CONNECTING
+import org.amnezia.vpn.protocol.ProtocolState.RECONNECTING
 import org.amnezia.vpn.protocol.ProtocolState.CONNECTED
 import org.amnezia.vpn.protocol.ProtocolState.DISCONNECTED
 import org.amnezia.vpn.util.Log
@@ -116,7 +118,10 @@ class ServiceNotification(private val context: Context) {
 
     private fun getAction(state: ProtocolState): Action? {
         return when (state) {
-            CONNECTED -> {
+            CONNECTED,
+            CONNECTING,
+            RECONNECTING,
+            -> {
                 Action(
                     0, context.getString(R.string.disconnect),
                     PendingIntent.getBroadcast(
