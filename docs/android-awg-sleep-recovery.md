@@ -165,5 +165,60 @@ Windows-host build патченного runtime не запускался. Corou
 ожидание handshake и retry, но не может принудительно прервать зависший JNI syscall.
 Native hang вне штатного поведения требует отдельной диагностики процесса.
 
-Полная APK-сборка и подпись фиксируются отдельно в итоговом сообщении вместе с
-артефактом: наличие native `.so` или успешных JVM-тестов не означает готовность APK.
+## Release APK
+
+Собран OSS release для arm64-v8a из `0de58825` (native-патч — `f714b2c4`):
+версия 5.1.0.6, versionCode 2191, minSdk 30, compileSdk/targetSdk 36.
+Использованы Qt 6.10.3, NDK 27.0.12077973 и JDK 17. Полная C++/Kotlin/Java
+сборка и release lint прошли: 331 Gradle tasks, 314 выполнены, 14 из cache,
+3 up-to-date. APK: `build/artifacts/AmneziaVPN-5.1.0.6-awg-recovery-arm64-release.apk`.
+
+Размер — 77 770 214 байт. SHA-256:
+`9a8d8bd2a010da9ec1cf59238b81fc40a66194681b9f3619553cf81db6a00936`.
+Проверены apksigner (v2), `debuggable=false`, единственный ABI arm64-v8a,
+zipalign с 16 KB и 16 KB ELF alignment AWG. В упакованной библиотеке присутствует
+новый JNI probe; Go build info показывает 1.25.0 и AWG 3.1.20260814 с патчами.
+
+Подпись локальная тестовая: CN=Local Amnezia Recovery Test. Официальная подпись
+не использована. APK нельзя установить поверх официальной версии с другой
+подписью. Перед ручной заменой приложения сохранить конфигурации; удаление
+приложения удаляет его данные. На чистом тестовом устройстве:
+
+```bash
+adb -s "$SERIAL" install build/artifacts/AmneziaVPN-5.1.0.6-awg-recovery-arm64-release.apk
+```
+
+Приватные build-параметры шлюза Premium/Free отсутствовали в окружении и в APK
+не включены. Импортированные self-hosted/native конфигурации не требуют этих
+параметров. Работа Premium/Free в такой локальной сборке не подтверждена.
+
+Обычная сборка при установленном Qt и SDK:
+
+```bash
+export JAVA_HOME="$(/usr/libexec/java_home -v 17)"
+export QT_ROOT_PATH="/path/to/Qt/6.10.3"
+export ANDROID_SDK_ROOT="/path/to/Android/sdk"
+export ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/27.0.12077973"
+CMAKE_BUILD_TYPE=Release APP_ANDROID_MIN_SDK=30 APP_ANDROID_VERSION_CODE_OFFSET=1 \
+  deploy/build.sh -t android --abi arm64-v8a -b build/android-release
+```
+
+Для подписанной release-сборки задать `QT_ANDROID_KEYSTORE_PATH`,
+`QT_ANDROID_KEYSTORE_ALIAS`, `QT_ANDROID_KEYSTORE_STORE_PASS` для собственного
+keystore. Не коммитить пароль или keystore. Использованный локальный ключ и
+пароль находятся в исключённом из Git каталоге `build/recovery-signing`.
+
+В этой среде основной Qt mirror и Amnezia Artifactory не отвечали. Qt установлен
+с зеркала FAU по опубликованным checksum; Conan-зависимости собраны из исходников
+через conancenter. Собственный wrapper Conan добавлял `--remote=conancenter`
+только при install. Для загрузки Go повторно использован архив, ранее проверенный
+по SHA-256, без изменения его содержимого.
+
+Из-за каталогов SDK android-37.0/37.1 Qt ошибочно выбрал отсутствующий android-37.
+Только в сгенерированном deployment JSON задано `android-compile-sdk-version=36`
+и повторён `cmake --build`. Это изменение окружения сборки, не исходников SDK
+или приложения. Если SDK 36 — последний установленный, такой шаг не нужен.
+
+Полный diff ветки сохранён в
+`build/artifacts/android-awg-sleep-recovery.patch`. Проверки на устройстве
+по-прежнему не выполнялись: `adb devices -l` не обнаружил подключённых устройств.
