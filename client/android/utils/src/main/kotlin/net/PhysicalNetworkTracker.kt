@@ -2,6 +2,7 @@ package org.amnezia.vpn.util.net
 
 class PhysicalNetworkTracker<K> {
     private val networks = mutableMapOf<K, Candidate>()
+    @Volatile
     var selected: K? = null
         private set
     var epoch: Long = 0

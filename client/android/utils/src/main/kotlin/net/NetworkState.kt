@@ -35,6 +35,7 @@ class NetworkState(
     private val networkCallback = object : NetworkCallback() {
         override fun onAvailable(network: Network) {
             if (isListenerBound) {
+                Log.d(TAG, "Physical network available: networkId=${network.networkHandle}")
                 tracker.available(network)
             }
         }
@@ -55,9 +56,18 @@ class NetworkState(
                 networkCapabilities.hasTransport(TRANSPORT_CELLULAR) -> 1
                 else -> 0
             }
-            val validationPriority = if (networkCapabilities.hasCapability(NET_CAPABILITY_VALIDATED)) 4 else 0
+            val validated = networkCapabilities.hasCapability(NET_CAPABILITY_VALIDATED)
+            val validationPriority = if (validated) 4 else 0
+            val transport = when (priority) {
+                3 -> "ethernet"
+                2 -> "wifi"
+                1 -> "cellular"
+                else -> "other"
+            }
+            Log.d(TAG, "Physical network capabilities: networkId=${network.networkHandle} " +
+                "transport=$transport usable=$usable validated=$validated")
             if (tracker.capabilities(network = network, usable = usable, priority = priority + validationPriority)) {
-                onNetworkChange()
+                notifyNetworkChange("capabilities")
             }
         }
 
@@ -65,20 +75,28 @@ class NetworkState(
             network: Network,
             blocked: Boolean,
         ) {
-            if (isListenerBound && tracker.blocked(network = network, blocked = blocked)) {
-                onNetworkChange()
+            if (isListenerBound) {
+                Log.d(TAG, "Physical network blocked: networkId=${network.networkHandle} blocked=$blocked")
+                if (tracker.blocked(network = network, blocked = blocked)) {
+                    notifyNetworkChange("blocked")
+                }
             }
         }
 
         override fun onLost(network: Network) {
-            if (isListenerBound && tracker.lost(network)) {
-                onNetworkChange()
+            if (isListenerBound) {
+                Log.d(TAG, "Physical network lost: networkId=${network.networkHandle}")
+                if (tracker.lost(network)) {
+                    notifyNetworkChange("lost")
+                }
             }
         }
     }
 
     val isOnline: Boolean
         get() = tracker.selected != null
+    val network: Network?
+        get() = tracker.selected
     val networkId: Long?
         get() = tracker.selected?.networkHandle
     val epoch: Long
@@ -112,5 +130,10 @@ class NetworkState(
         isListenerBound = false
         connectivityManager.unregisterNetworkCallback(networkCallback)
         tracker.clear()
+    }
+
+    private fun notifyNetworkChange(reason: String) {
+        Log.d(TAG, "Physical network selected: reason=$reason networkId=$networkId epoch=$epoch online=$isOnline")
+        onNetworkChange()
     }
 }

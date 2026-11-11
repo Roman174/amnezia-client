@@ -55,8 +55,12 @@ class AwgAndroid(ConanFile):
         Git(self, folder=go_source).checkout("1b86b2ae0e493e7ea93f8c1a0f0cb6735b1551f1")
         patch(self, base_path=go_source, patch_file=os.path.join(
             self.export_sources_folder, "patches", "0001-recover-timers-and-observe-tunnel.patch"))
+        patch(self, base_path=go_source, patch_file=os.path.join(
+            self.export_sources_folder, "patches", "0004-udp-receive-diagnostics.patch"))
         patch(self, base_path=self._upstream_folder, patch_file=os.path.join(
             self.export_sources_folder, "patches", "0002-android-probe-and-boottime-toolchain.patch"))
+        patch(self, base_path=self._upstream_folder, patch_file=os.path.join(
+            self.export_sources_folder, "patches", "0003-stage-peer-startup.patch"))
 
     def generate(self):
         VirtualBuildEnv(self).generate()

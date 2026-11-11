@@ -187,6 +187,13 @@ open class Wireguard : Protocol() {
         if (tunnelHandle >= 0) {
             return
         }
+
+        val deviceSettings = buildString {
+            config.appendDeviceLine(this)
+        }
+        val peerSettings = buildString {
+            config.appendPeerLine(this)
+        }
         if (tunnelDescriptor == null) {
             buildVpnInterface(config, vpnBuilder)
             tunnelDescriptor = vpnBuilder.establish()
@@ -197,15 +204,33 @@ open class Wireguard : Protocol() {
         tunnelHandle = GoBackend.awgTurnOn(
             ifName = ifName,
             tunFd = ParcelFileDescriptor.dup(descriptor.fileDescriptor).detachFd(),
-            settings = config.toWgUserspaceString(),
+            settings = deviceSettings,
         )
         if (tunnelHandle < 0) {
             tunnelHandle = -1
             throw VpnStartException("Wireguard tunnel creation error")
         }
-        if (!protect(GoBackend.awgGetSocketV4(tunnelHandle)) || !protect(GoBackend.awgGetSocketV6(tunnelHandle))) {
+        try {
+            val sockets = listOf(
+                GoBackend.awgGetSocketV4(tunnelHandle),
+                GoBackend.awgGetSocketV6(tunnelHandle),
+            ).filter { it >= 0 }
+            if (sockets.isEmpty() || sockets.any { !protect(it) }) {
+                throw VpnStartException("Protect VPN interface: permission not granted or revoked")
+            }
+            val result = GoBackend.awgSetConfig(
+                handle = tunnelHandle,
+                settings = peerSettings,
+            )
+            if (result != 0) {
+                throw VpnStartException("WireGuard peer configuration failed")
+            }
+        } catch (_: LinkageError) {
             turnOffVpn()
-            throw VpnStartException("Protect VPN interface: permission not granted or revoked")
+            throw VpnStartException("Incompatible WireGuard startup backend")
+        } catch (e: Exception) {
+            turnOffVpn()
+            throw e
         }
     }
 

@@ -3,6 +3,10 @@ package org.amnezia.awg
 object GoBackend {
     external fun awgProbe(handle: Int): Int
     external fun awgGetConfig(handle: Int): String?
+    external fun awgSetConfig(
+        handle: Int,
+        settings: String,
+    ): Int
     external fun awgGetSocketV4(handle: Int): Int
     external fun awgGetSocketV6(handle: Int): Int
     external fun awgTurnOff(handle: Int)

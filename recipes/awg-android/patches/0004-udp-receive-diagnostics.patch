@@ -1,0 +1,330 @@
+diff --git a/device/device.go b/device/device.go
+--- a/device/device.go
++++ b/device/device.go
+@@ -18,6 +18,30 @@
+ )
+ 
+ type Device struct {
++	receiveStats struct {
++		packets            atomic.Uint64
++		bytes              atomic.Uint64
++		errors             atomic.Uint64
++		invalidSize        atomic.Uint64
++		headerError        atomic.Uint64
++		unknownType        atomic.Uint64
++		unknownReceiver    atomic.Uint64
++		expiredKey         atomic.Uint64
++		handshakeQueueFull atomic.Uint64
++		invalidMac         atomic.Uint64
++		cookieRequired     atomic.Uint64
++		rateLimited        atomic.Uint64
++		cookieRejected     atomic.Uint64
++		initiationRejected atomic.Uint64
++		responseRejected   atomic.Uint64
++		transportDecrypt   atomic.Uint64
++		transportReplay    atomic.Uint64
++		peerStopped        atomic.Uint64
++		invalidIp          atomic.Uint64
++		disallowedSource   atomic.Uint64
++		sessionError       atomic.Uint64
++	}
++
+ 	state struct {
+ 		// state holds the device's state. It is accessed atomically.
+ 		// Use the device.deviceState method to read it.
+diff --git a/device/receive.go b/device/receive.go
+--- a/device/receive.go
++++ b/device/receive.go
+@@ -119,6 +119,7 @@
+ 			if errors.Is(err, net.ErrClosed) {
+ 				return
+ 			}
++			device.receiveStats.errors.Add(1)
+ 			device.log.Verbosef("Failed to receive %s packet: %v", recvName, err)
+ 			if neterr, ok := err.(net.Error); ok && !neterr.Temporary() {
+ 				return
+@@ -131,10 +132,17 @@
+ 			return
+ 		}
+ 		deathSpiral = 0
++		device.receiveStats.packets.Add(uint64(count))
++		var receivedBytes uint64
++		for _, size := range sizes[:count] {
++			receivedBytes += uint64(size)
++		}
++		device.receiveStats.bytes.Add(receivedBytes)
+ 
+ 		// handle each packet in the batch
+ 		for i, size := range sizes[:count] {
+ 			if size < MinMessageSize {
++				device.receiveStats.invalidSize.Add(1)
+ 				continue
+ 			}
+ 
+@@ -143,6 +151,7 @@
+ 
+ 			cip, err := device.HeaderProtectionCipher(packet[:HeaderCipherNonceSize])
+ 			if err != nil {
++				device.receiveStats.headerError.Add(1)
+ 				device.log.Errorf("Failed to initialize header cipher")
+ 				continue
+ 			}
+@@ -174,6 +183,7 @@
+ 				// check size
+ 
+ 				if len(packet) < MessageTransportSize {
++					device.receiveStats.invalidSize.Add(1)
+ 					continue
+ 				}
+ 				if cip != nil {
+@@ -188,12 +198,14 @@
+ 				value := device.indexTable.Lookup(receiver)
+ 				keypair := value.keypair
+ 				if keypair == nil {
++					device.receiveStats.unknownReceiver.Add(1)
+ 					continue
+ 				}
+ 
+ 				// check keypair expiry
+ 
+ 				if keypair.created.Add(device.keychainExpireTime()).Before(time.Now()) {
++					device.receiveStats.expiredKey.Add(1)
+ 					continue
+ 				}
+ 
+@@ -222,6 +234,7 @@
+ 
+ 			case MessageInitiationType:
+ 				if len(packet) != MessageInitiationSize {
++					device.receiveStats.invalidSize.Add(1)
+ 					continue
+ 				}
+ 				if cip != nil {
+@@ -230,6 +243,7 @@
+ 
+ 			case MessageResponseType:
+ 				if len(packet) != MessageResponseSize {
++					device.receiveStats.invalidSize.Add(1)
+ 					continue
+ 				}
+ 				if cip != nil {
+@@ -238,6 +252,7 @@
+ 
+ 			case MessageCookieReplyType:
+ 				if len(packet) != MessageCookieReplySize {
++					device.receiveStats.invalidSize.Add(1)
+ 					continue
+ 				}
+ 				if cip != nil {
+@@ -245,6 +260,7 @@
+ 				}
+ 
+ 			default:
++				device.receiveStats.unknownType.Add(1)
+ 				device.log.Verbosef("Received message with unknown type")
+ 				continue
+ 			}
+@@ -259,6 +275,7 @@
+ 				bufsArrs[i] = device.GetMessageBuffer()
+ 				bufs[i] = bufsArrs[i][:]
+ 			default:
++				device.receiveStats.handshakeQueueFull.Add(1)
+ 			}
+ 		}
+ 		for peer, elemsContainer := range elemsByPeer {
+@@ -266,6 +283,7 @@
+ 				peer.queue.inbound.c <- elemsContainer
+ 				device.queue.decryption.c <- elemsContainer
+ 			} else {
++				device.receiveStats.peerStopped.Add(uint64(len(elemsContainer.elems)))
+ 				for _, elem := range elemsContainer.elems {
+ 					device.PutMessageBuffer(elem.buffer)
+ 					device.PutInboundElement(elem)
+@@ -301,6 +319,7 @@
+ 				nil,
+ 			)
+ 			if err != nil {
++				device.receiveStats.transportDecrypt.Add(1)
+ 				elem.packet = nil
+ 			}
+ 		}
+@@ -330,6 +349,7 @@
+ 			reader := bytes.NewReader(elem.packet)
+ 			err := binary.Read(reader, binary.LittleEndian, &reply)
+ 			if err != nil {
++				device.receiveStats.cookieRejected.Add(1)
+ 				device.log.Verbosef("Failed to decode cookie reply")
+ 				goto skip
+ 			}
+@@ -339,6 +359,7 @@
+ 			entry := device.indexTable.Lookup(reply.Receiver)
+ 
+ 			if entry.peer == nil {
++				device.receiveStats.unknownReceiver.Add(1)
+ 				goto skip
+ 			}
+ 
+@@ -350,10 +371,13 @@
+ 					elem.endpoint.DstToString(),
+ 				)
+ 				if !peer.cookieGenerator.ConsumeReply(&reply) {
++					device.receiveStats.cookieRejected.Add(1)
+ 					device.log.Verbosef(
+ 						"Could not decrypt invalid cookie response",
+ 					)
+ 				}
++			} else {
++				device.receiveStats.peerStopped.Add(1)
+ 			}
+ 
+ 			goto skip
+@@ -363,6 +387,7 @@
+ 			// check mac fields and maybe ratelimit
+ 
+ 			if !device.cookieChecker.CheckMAC1(elem.packet) {
++				device.receiveStats.invalidMac.Add(1)
+ 				device.log.Verbosef("Received packet with invalid mac1")
+ 				goto skip
+ 			}
+@@ -374,6 +399,7 @@
+ 				// verify MAC2 field
+ 
+ 				if !device.cookieChecker.CheckMAC2(elem.packet, elem.endpoint.DstToBytes()) {
++					device.receiveStats.cookieRequired.Add(1)
+ 					device.SendHandshakeCookie(&elem)
+ 					goto skip
+ 				}
+@@ -381,6 +407,7 @@
+ 				// check ratelimiter
+ 
+ 				if !device.rate.limiter.Allow(elem.endpoint.DstIP()) {
++					device.receiveStats.rateLimited.Add(1)
+ 					goto skip
+ 				}
+ 			}
+@@ -399,6 +426,7 @@
+ 			reader := bytes.NewReader(elem.packet)
+ 			err := binary.Read(reader, binary.LittleEndian, &msg)
+ 			if err != nil {
++				device.receiveStats.initiationRejected.Add(1)
+ 				device.log.Errorf("Failed to decode initiation message")
+ 				goto skip
+ 			}
+@@ -409,6 +437,7 @@
+ 			// consume initiation
+ 			peer := device.ConsumeMessageInitiation(&msg)
+ 			if peer == nil {
++				device.receiveStats.initiationRejected.Add(1)
+ 				device.log.Verbosef("Received invalid initiation message from %s", elem.endpoint.DstToString())
+ 				goto skip
+ 			}
+@@ -434,6 +463,7 @@
+ 			reader := bytes.NewReader(elem.packet)
+ 			err := binary.Read(reader, binary.LittleEndian, &msg)
+ 			if err != nil {
++				device.receiveStats.responseRejected.Add(1)
+ 				device.log.Errorf("Failed to decode response message")
+ 				goto skip
+ 			}
+@@ -445,6 +475,7 @@
+ 
+ 			peer := device.ConsumeMessageResponse(&msg)
+ 			if peer == nil {
++				device.receiveStats.responseRejected.Add(1)
+ 				device.log.Verbosef("Received invalid response message from %s", elem.endpoint.DstToString())
+ 				goto skip
+ 			}
+@@ -465,6 +496,7 @@
+ 			err = peer.BeginSymmetricSession()
+ 
+ 			if err != nil {
++				device.receiveStats.sessionError.Add(1)
+ 				device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
+ 				goto skip
+ 			}
+@@ -503,6 +535,7 @@
+ 			}
+ 
+ 			if !elem.keypair.replayFilter.ValidateCounter(elem.counter, RejectAfterMessages) {
++				device.receiveStats.transportReplay.Add(1)
+ 				continue
+ 			}
+ 
+@@ -528,38 +561,45 @@
+ 			switch elem.packet[0] >> 4 {
+ 			case 4:
+ 				if len(elem.packet) < ipv4.HeaderLen {
++					device.receiveStats.invalidIp.Add(1)
+ 					continue
+ 				}
+ 				field := elem.packet[IPv4offsetTotalLength : IPv4offsetTotalLength+2]
+ 				length := binary.BigEndian.Uint16(field)
+ 				if int(length) > len(elem.packet) || int(length) < ipv4.HeaderLen {
++					device.receiveStats.invalidIp.Add(1)
+ 					continue
+ 				}
+ 				elem.packet = elem.packet[:length]
+ 				src := elem.packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]
+ 				if device.allowedips.Lookup(src) != peer {
++					device.receiveStats.disallowedSource.Add(1)
+ 					device.log.Verbosef("IPv4 packet with disallowed source address from %v", peer)
+ 					continue
+ 				}
+ 
+ 			case 6:
+ 				if len(elem.packet) < ipv6.HeaderLen {
++					device.receiveStats.invalidIp.Add(1)
+ 					continue
+ 				}
+ 				field := elem.packet[IPv6offsetPayloadLength : IPv6offsetPayloadLength+2]
+ 				length := binary.BigEndian.Uint16(field)
+ 				length += ipv6.HeaderLen
+ 				if int(length) > len(elem.packet) {
++					device.receiveStats.invalidIp.Add(1)
+ 					continue
+ 				}
+ 				elem.packet = elem.packet[:length]
+ 				src := elem.packet[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]
+ 				if device.allowedips.Lookup(src) != peer {
++					device.receiveStats.disallowedSource.Add(1)
+ 					device.log.Verbosef("IPv6 packet with disallowed source address from %v", peer)
+ 					continue
+ 				}
+ 
+ 			default:
++				device.receiveStats.invalidIp.Add(1)
+ 				device.log.Verbosef(
+ 					"Packet with invalid IP version from %v",
+ 					peer,
+diff --git a/device/uapi.go b/device/uapi.go
+--- a/device/uapi.go
++++ b/device/uapi.go
+@@ -99,6 +99,28 @@
+ 		defer device.headerProtection.RUnlock()
+ 
+ 		// serialize device related values
++
++		sendf("udp_rx_packets=%d", device.receiveStats.packets.Load())
++		sendf("udp_rx_bytes=%d", device.receiveStats.bytes.Load())
++		sendf("udp_rx_errors=%d", device.receiveStats.errors.Load())
++		sendf("udp_rx_invalid_size=%d", device.receiveStats.invalidSize.Load())
++		sendf("udp_rx_header_error=%d", device.receiveStats.headerError.Load())
++		sendf("udp_rx_unknown_type=%d", device.receiveStats.unknownType.Load())
++		sendf("udp_rx_unknown_receiver=%d", device.receiveStats.unknownReceiver.Load())
++		sendf("udp_rx_expired_key=%d", device.receiveStats.expiredKey.Load())
++		sendf("udp_rx_handshake_queue_full=%d", device.receiveStats.handshakeQueueFull.Load())
++		sendf("udp_rx_invalid_mac=%d", device.receiveStats.invalidMac.Load())
++		sendf("udp_rx_cookie_required=%d", device.receiveStats.cookieRequired.Load())
++		sendf("udp_rx_rate_limited=%d", device.receiveStats.rateLimited.Load())
++		sendf("udp_rx_cookie_rejected=%d", device.receiveStats.cookieRejected.Load())
++		sendf("udp_rx_initiation_rejected=%d", device.receiveStats.initiationRejected.Load())
++		sendf("udp_rx_response_rejected=%d", device.receiveStats.responseRejected.Load())
++		sendf("udp_rx_transport_decrypt=%d", device.receiveStats.transportDecrypt.Load())
++		sendf("udp_rx_transport_replay=%d", device.receiveStats.transportReplay.Load())
++		sendf("udp_rx_peer_stopped=%d", device.receiveStats.peerStopped.Load())
++		sendf("udp_rx_invalid_ip=%d", device.receiveStats.invalidIp.Load())
++		sendf("udp_rx_disallowed_source=%d", device.receiveStats.disallowedSource.Load())
++		sendf("udp_rx_session_error=%d", device.receiveStats.sessionError.Load())
+ 
+ 		if !device.staticIdentity.privateKey.IsZero() {
+ 			keyf("private_key", (*[32]byte)(&device.staticIdentity.privateKey))

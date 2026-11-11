@@ -2,6 +2,7 @@ package org.amnezia.vpn.protocol.wireguard.recovery
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -23,10 +24,12 @@ class TunnelRecovery(
     private val elapsedMillis: () -> Long,
     private val onFailure: () -> Unit,
     private val handshakeTimeoutMillis: Long = 45_000,
+    private val onDiagnostic: (String) -> Unit = {},
 ) {
     private val environment = MutableStateFlow(Environment())
     private val health = TunnelHealth()
     private var lastAttemptMillis: Long? = null
+    private var restartReason = "initial"
 
     fun updateNetwork(
         online: Boolean,
@@ -64,7 +67,8 @@ class TunnelRecovery(
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            onDiagnostic("Recovery failed: error=${e.javaClass.simpleName}")
             onFailure()
         } finally {
             withContext(NonCancellable) {
@@ -78,40 +82,85 @@ class TunnelRecovery(
         var failure: Exception? = null
         var needsStart = initial
         repeat(5) { attempt ->
+            var stage = "waiting_network"
             if (attempt > 0) {
                 publish(ProtocolState.RECONNECTING)
-                delay((2_000L shl (attempt - 1)).coerceAtMost(30_000))
+                val retryDelayMillis = (2_000L shl (attempt - 1)).coerceAtMost(30_000)
+                onDiagnostic("Retry scheduled: attempt=${attempt + 1} reason=$restartReason delayMillis=$retryDelayMillis")
+                delay(retryDelayMillis)
             }
             try {
                 return withTimeout(handshakeTimeoutMillis) {
-                    val network = environment.first { it.online && !it.idle }
-                    lastAttemptMillis?.let {
-                        delay((2_000 - (elapsedMillis() - it)).coerceAtLeast(0))
-                    }
-                    lastAttemptMillis = elapsedMillis()
-                    if (needsStart) {
-                        needsStart = false
-                        start()
-                    } else {
-                        restart()
-                    }
-                    probe()
-                    while (true) {
-                        currentCoroutineContext().ensureActive()
-                        val current = snapshot() ?: error("Tunnel telemetry unavailable")
-                        if (current.handshakeMillis > 0) {
-                            break
+                    var network: Environment
+                    var connected: Boolean
+                    do {
+                        lastAttemptMillis?.let {
+                            delay((2_000 - (elapsedMillis() - it)).coerceAtLeast(0))
                         }
-                        delay(1_000)
-                    }
+                        network = environment.first {
+                            it.online && !it.idle
+                        }
+                        stage = "backend_start"
+                        lastAttemptMillis = elapsedMillis()
+                        val operation = if (needsStart) "start" else "restart"
+                        onDiagnostic("Backend $operation: attempt=${attempt + 1} reason=$restartReason " +
+                            "networkId=${network.networkId} epoch=${network.networkEpoch}")
+                        if (needsStart) {
+                            start()
+                            needsStart = false
+                        } else {
+                            restart()
+                        }
+                        stage = "probe"
+                        probe()
+                        stage = "handshake"
+                        connected = awaitHandshake(network)
+                        if (!connected) {
+                            publish(ProtocolState.RECONNECTING)
+                        }
+                        stage = "waiting_network"
+                    } while (!connected)
                     network
                 }
             } catch (e: Exception) {
                 currentCoroutineContext().ensureActive()
+                restartReason = if (e is TimeoutCancellationException) {
+                    "${stage}_timeout"
+                } else {
+                    "attempt_failed"
+                }
+                onDiagnostic("Attempt failed: attempt=${attempt + 1} reason=$restartReason " +
+                    "stage=$stage error=${e.javaClass.simpleName} environment=${environment.value}")
                 failure = e
             }
         }
         throw IllegalStateException("Tunnel recovery failed", failure)
+    }
+
+    private suspend fun awaitHandshake(network: Environment): Boolean {
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            val currentEnvironment = environment.value
+            if (!currentEnvironment.online || currentEnvironment.idle ||
+                currentEnvironment.networkId != network.networkId
+            ) {
+                restartReason = when {
+                    !currentEnvironment.online -> "network_unavailable"
+                    currentEnvironment.idle -> "device_idle"
+                    else -> "network_changed"
+                }
+                onDiagnostic("Handshake interrupted: reason=$restartReason " +
+                    "startedNetworkId=${network.networkId} environment=$currentEnvironment")
+                return false
+            }
+
+            val current = snapshot() ?: error("Tunnel telemetry unavailable")
+            if (current.handshakeMillis > 0) {
+                onDiagnostic("Handshake confirmed: networkId=${network.networkId}")
+                return true
+            }
+            delay(1_000)
+        }
     }
 
     private suspend fun monitor(connectedEnvironment: Environment) {
@@ -134,6 +183,9 @@ class TunnelRecovery(
                 continue
             }
             if (!next.online || next.networkId != connectedEnvironment.networkId) {
+                restartReason = if (next.online) "network_changed" else "network_unavailable"
+                onDiagnostic("Monitor interrupted: reason=$restartReason " +
+                    "connectedNetworkId=${connectedEnvironment.networkId} environment=$next")
                 return
             }
             if (next.wakeEpoch != observed.wakeEpoch) {
@@ -146,7 +198,11 @@ class TunnelRecovery(
             }
             if (health.needsProbe(snapshot = snapshot(), elapsedMillis = elapsedMillis())) {
                 when (confirmHealth()) {
-                    HealthResult.UNHEALTHY -> return
+                    HealthResult.UNHEALTHY -> {
+                        restartReason = "health_check_failed"
+                        onDiagnostic("Monitor interrupted: reason=$restartReason environment=${environment.value}")
+                        return
+                    }
                     HealthResult.HEALTHY -> health.reset(snapshot())
                     HealthResult.DEFERRED -> {}
                 }
@@ -159,9 +215,11 @@ class TunnelRecovery(
         return withTimeoutOrNull(handshakeTimeoutMillis) {
             val wait = probe()
             if (wait > 0) {
+                onDiagnostic("Health probe deferred: delayMillis=$wait")
                 return@withTimeoutOrNull HealthResult.DEFERRED
             }
             if (wait < 0) {
+                onDiagnostic("Health probe failed")
                 return@withTimeoutOrNull HealthResult.UNHEALTHY
             }
             while (true) {
@@ -169,6 +227,7 @@ class TunnelRecovery(
                     return@withTimeoutOrNull HealthResult.DEFERRED
                 }
                 if (!environment.value.online) {
+                    onDiagnostic("Health probe interrupted: reason=network_unavailable")
                     return@withTimeoutOrNull HealthResult.UNHEALTHY
                 }
                 delay(1_000)
@@ -179,7 +238,10 @@ class TunnelRecovery(
             }
             @Suppress("UNREACHABLE_CODE")
             HealthResult.UNHEALTHY
-        } ?: HealthResult.UNHEALTHY
+        } ?: run {
+            onDiagnostic("Health probe timed out: timeoutMillis=$handshakeTimeoutMillis")
+            HealthResult.UNHEALTHY
+        }
     }
 
     private suspend fun publish(value: ProtocolState) {

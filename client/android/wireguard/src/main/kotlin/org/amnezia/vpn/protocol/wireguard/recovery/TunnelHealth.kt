@@ -6,6 +6,7 @@ data class TunnelSnapshot(
     val sentBytes: Long,
     val outboundBytes: Long,
     val sendErrors: Long,
+    val udp: UdpSnapshot? = null,
 ) {
     companion object {
         fun parse(config: String?): TunnelSnapshot? {
@@ -27,6 +28,7 @@ data class TunnelSnapshot(
                 sentBytes = values["tx_bytes"] ?: return null,
                 outboundBytes = values["tun_tx_bytes"] ?: return null,
                 sendErrors = values["tx_errors"] ?: return null,
+                udp = UdpSnapshot.parse(values),
             ).takeIf {
                 it.handshakeMillis >= 0 && it.receivedBytes >= 0 && it.sentBytes >= 0 &&
                     it.outboundBytes >= 0 && it.sendErrors >= 0

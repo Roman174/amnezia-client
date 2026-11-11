@@ -77,13 +77,6 @@ open class WireguardConfig protected constructor(
         builder.disableCookies,
     )
 
-    fun toWgUserspaceString(): String = with(StringBuilder()) {
-        appendDeviceLine(this)
-        appendLine("replace_peers=true")
-        appendPeerLine(this)
-        return this.toString()
-    }
-
     open fun appendDeviceLine(sb: StringBuilder) = with(sb) {
         appendLine("private_key=$privateKeyHex")
         if (useProtocolExtension) {

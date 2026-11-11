@@ -1,0 +1,51 @@
+diff --git a/tunnel/tools/libwg-go/api-android.go b/tunnel/tools/libwg-go/api-android.go
+--- a/tunnel/tools/libwg-go/api-android.go
++++ b/tunnel/tools/libwg-go/api-android.go
+@@ -207,6 +207,18 @@
+ 	return C.CString(settings)
+ }
+ 
++//export awgSetConfig
++func awgSetConfig(tunnelHandle int32, settings string) int32 {
++	handle, ok := tunnelHandles[tunnelHandle]
++	if !ok {
++		return -1
++	}
++	if err := handle.device.IpcSet(settings); err != nil {
++		return -1
++	}
++	return 0
++}
++
+ //export awgProbe
+ func awgProbe(tunnelHandle int32) int32 {
+ 	handle, ok := tunnelHandles[tunnelHandle]
+diff --git a/tunnel/tools/libwg-go/jni.c b/tunnel/tools/libwg-go/jni.c
+--- a/tunnel/tools/libwg-go/jni.c
++++ b/tunnel/tools/libwg-go/jni.c
+@@ -15,6 +15,7 @@
+ extern char *awgGetConfig(int handle);
+ extern char *awgVersion();
+ extern int awgProbe(int handle);
++extern int awgSetConfig(int handle, struct go_string settings);
+ 
+ JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgTurnOn(JNIEnv *env, jclass c, jstring ifname, jint tun_fd, jstring settings)
+ {
+@@ -75,3 +76,17 @@
+ {
+  return awgProbe(handle);
+ }
++
++JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgSetConfig(JNIEnv *env, jclass c, jint handle, jstring settings)
++{
++	const char *settings_str = (*env)->GetStringUTFChars(env, settings, 0);
++	if (!settings_str)
++		return -1;
++	size_t settings_len = (*env)->GetStringUTFLength(env, settings);
++	int ret = awgSetConfig(handle, (struct go_string){
++		.str = settings_str,
++		.n = settings_len
++	});
++	(*env)->ReleaseStringUTFChars(env, settings, settings_str);
++	return ret;
++}

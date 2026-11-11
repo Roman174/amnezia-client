@@ -16,14 +16,18 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.Message
 import android.os.Messenger
+import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.Process
 import android.os.SystemClock
+import android.system.Os
 import androidx.annotation.MainThread
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import java.net.UnknownHostException
+import java.net.Inet6Address
+import java.net.InetSocketAddress
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.LazyThreadSafetyMode.NONE
 import kotlinx.coroutines.CancellationException
@@ -607,10 +611,17 @@ open class AmneziaVpnService : VpnService() {
         return TunnelRecovery(
             state = protocolState,
             start = {
-                protocol.startVpn(config = config, vpnBuilder = Builder(), protect = ::protect)
+                protocol.startVpn(
+                    config = config,
+                    vpnBuilder = Builder(),
+                    protect = networkSocketProtector(),
+                )
             },
             restart = {
-                protocol.reconnectVpn(vpnBuilder = Builder(), protect = ::protect)
+                protocol.reconnectVpn(
+                    vpnBuilder = Builder(),
+                    protect = networkSocketProtector(),
+                )
             },
             stop = protocol::stopVpn,
             snapshot = {
@@ -623,7 +634,45 @@ open class AmneziaVpnService : VpnService() {
             onFailure = {
                 onError("WireGuard connection recovery failed")
             },
+            onDiagnostic = { message ->
+                Log.d(TAG, "Tunnel recovery: $message")
+            },
         )
+    }
+
+    private fun networkSocketProtector(): (Int) -> Boolean {
+        val network = networkState.network ?: throw VpnStartException("Physical network unavailable")
+
+        return { socket ->
+            val protected = protect(socket)
+            Log.d(TAG, "AWG socket protection: socket=$socket networkId=${network.networkHandle} protected=$protected")
+            if (protected) {
+                try {
+                    ParcelFileDescriptor.fromFd(socket).use {
+                        network.bindSocket(it.fileDescriptor)
+                        val local = try {
+                            Os.getsockname(it.fileDescriptor) as? InetSocketAddress
+                        } catch (_: Exception) {
+                            null
+                        }
+                        val family = when (local?.address) {
+                            null -> "unknown"
+                            is Inet6Address -> "ipv6"
+                            else -> "ipv4"
+                        }
+                        Log.d(TAG, "AWG socket bound: socket=$socket networkId=${network.networkHandle} " +
+                            "family=$family localPort=${local?.port}")
+                    }
+                    true
+                } catch (e: Exception) {
+                    Log.w(TAG, "AWG socket bind failed: socket=$socket networkId=${network.networkHandle} " +
+                        "error=${e.javaClass.simpleName}")
+                    throw e
+                }
+            } else {
+                false
+            }
+        }
     }
 
     @MainThread
